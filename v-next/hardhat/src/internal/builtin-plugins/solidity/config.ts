@@ -16,7 +16,9 @@ import {
 } from "@nomicfoundation/hardhat-zod-utils";
 import { z } from "zod";
 
-import { DEFAULT_BUILD_PROFILES } from "./build-profiles.js";
+import {
+  DEFAULT_BUILD_PROFILES,
+} from "./build-profiles.js";
 
 const sourcePathsType = conditionalUnionType(
   [
@@ -282,6 +284,8 @@ function resolveSolidityConfig(
           },
         ],
         overrides: {},
+        mergeCompilationJobs: profile.mergeCompilationJobs,
+        concurrency: profile.concurrency,
       };
       continue;
     }
@@ -304,6 +308,8 @@ function resolveSolidityConfig(
           },
         ),
       ),
+      mergeCompilationJobs: profile.mergeCompilationJobs,
+      concurrency: profile.concurrency,
     };
   }
 
