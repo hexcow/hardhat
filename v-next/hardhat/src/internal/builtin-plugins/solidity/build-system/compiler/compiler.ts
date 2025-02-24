@@ -3,7 +3,8 @@ import type {
   CompilerOutput,
 } from "../../../../../types/solidity/compiler-io.js";
 
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
+import { createWriteStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -13,7 +14,12 @@ import {
   assertHardhatInvariant,
 } from "@nomicfoundation/hardhat-errors";
 import { ensureError } from "@nomicfoundation/hardhat-utils/error";
-import { mkdir } from "@nomicfoundation/hardhat-utils/fs";
+import {
+  mkdir,
+  readJsonFileAsStream,
+  remove,
+} from "@nomicfoundation/hardhat-utils/fs";
+import { createNonClosingWriter } from "@nomicfoundation/hardhat-utils/stream";
 import * as semver from "semver";
 
 export interface Compiler {
@@ -25,7 +31,51 @@ export interface Compiler {
   compile(input: CompilerInput): Promise<CompilerOutput>;
 }
 
-const COMPILATION_SUBPROCESS_IO_BUFFER_SIZE = 1024 * 1024 * 500;
+async function spawnCompile(
+  command: string,
+  args: string[],
+  input: CompilerInput,
+): Promise<CompilerOutput> {
+  const tmpFolder = path.join(os.tmpdir(), "hardhat-solc", crypto.randomUUID());
+  await mkdir(tmpFolder);
+
+  try {
+    return await new Promise((resolve, reject) => {
+      const stdoutPath = path.join(tmpFolder, "stdout.txt");
+
+      const subprocess = spawn(command, args);
+
+      subprocess.on("close", async (code) => {
+        if (code !== 0) {
+          return reject(new Error(`Subprocess exited with code ${code}`));
+        }
+        resolve(await readJsonFileAsStream(stdoutPath));
+      });
+
+      assertHardhatInvariant(
+        subprocess.stdout !== null,
+        "process.stdout is null",
+      );
+      assertHardhatInvariant(
+        subprocess.stderr !== null,
+        "process.stderr is null",
+      );
+
+      subprocess.stdout.pipe(createWriteStream(stdoutPath));
+      subprocess.stderr.pipe(createNonClosingWriter(process.stderr));
+
+      assertHardhatInvariant(
+        subprocess.stdin !== null,
+        "process.stdin is null",
+      );
+
+      subprocess.stdin.write(JSON.stringify(input));
+      subprocess.stdin.end();
+    });
+  } finally {
+    await remove(tmpFolder);
+  }
+}
 
 export class SolcJsCompiler implements Compiler {
   public readonly isSolcJs = true;
@@ -36,7 +86,7 @@ export class SolcJsCompiler implements Compiler {
     public readonly compilerPath: string,
   ) {}
 
-  public async compile(input: CompilerInput): Promise<any> {
+  public async compile(input: CompilerInput): Promise<CompilerOutput> {
     const scriptFileUrl = import.meta.resolve("./solcjs-runner.js");
     const scriptPath = fileURLToPath(scriptFileUrl);
 
@@ -65,40 +115,16 @@ export class SolcJsCompiler implements Compiler {
       args.push(scriptPath, this.compilerPath);
     }
 
-    const output: string = await new Promise((resolve, reject) => {
-      try {
-        const subprocess = execFile(
-          process.execPath,
-          args,
-          {
-            maxBuffer: COMPILATION_SUBPROCESS_IO_BUFFER_SIZE,
-          },
-          (err, stdout) => {
-            if (err !== null) {
-              return reject(err);
-            }
-            resolve(stdout);
-          },
-        );
+    try {
+      return await spawnCompile(process.execPath, args, input);
+    } catch (e) {
+      ensureError(e);
 
-        assertHardhatInvariant(
-          subprocess.stdin !== null,
-          "process.stdin should be defined",
-        );
-
-        subprocess.stdin.write(JSON.stringify(input));
-        subprocess.stdin.end();
-      } catch (e) {
-        ensureError(e);
-
-        throw new HardhatError(
-          HardhatError.ERRORS.SOLIDITY.CANT_RUN_SOLCJS_COMPILER,
-          e,
-        );
-      }
-    });
-
-    return JSON.parse(output);
+      throw new HardhatError(
+        HardhatError.ERRORS.SOLIDITY.CANT_RUN_SOLCJS_COMPILER,
+        e,
+      );
+    }
   }
 }
 
@@ -111,7 +137,7 @@ export class NativeCompiler implements Compiler {
     public readonly compilerPath: string,
   ) {}
 
-  public async compile(input: CompilerInput): Promise<any> {
+  public async compile(input: CompilerInput): Promise<CompilerOutput> {
     const args = ["--standard-json"];
 
     // Logic to make sure that solc default import callback is not being used.
@@ -129,36 +155,15 @@ export class NativeCompiler implements Compiler {
       }
     }
 
-    const output: string = await new Promise((resolve, reject) => {
-      try {
-        const process = execFile(
-          this.compilerPath,
-          args,
-          {
-            maxBuffer: COMPILATION_SUBPROCESS_IO_BUFFER_SIZE,
-          },
-          (err, stdout) => {
-            if (err !== null) {
-              return reject(err);
-            }
-            resolve(stdout);
-          },
-        );
+    try {
+      return await spawnCompile(this.compilerPath, args, input);
+    } catch (e) {
+      ensureError(e);
 
-        assertHardhatInvariant(process.stdin !== null, "process.stdin is null");
-
-        process.stdin.write(JSON.stringify(input));
-        process.stdin.end();
-      } catch (e) {
-        ensureError(e);
-
-        throw new HardhatError(
-          HardhatError.ERRORS.SOLIDITY.CANT_RUN_NATIVE_COMPILER,
-          e,
-        );
-      }
-    });
-
-    return JSON.parse(output);
+      throw new HardhatError(
+        HardhatError.ERRORS.SOLIDITY.CANT_RUN_NATIVE_COMPILER,
+        e,
+      );
+    }
   }
 }

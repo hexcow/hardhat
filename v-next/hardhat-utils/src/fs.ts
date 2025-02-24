@@ -1,5 +1,12 @@
+import type { ReadStream, WriteStream } from "node:fs";
+
+import { createReadStream, createWriteStream } from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
+import { finished } from "node:stream/promises";
+
+import { JSONParser } from "@streamparser/json-node";
+import { JsonStreamStringify } from "json-stream-stringify";
 
 import { ensureError } from "./error.js";
 import {
@@ -188,6 +195,61 @@ export async function readJsonFile<T>(absolutePathToFile: string): Promise<T> {
 }
 
 /**
+ * Reads a JSON file as a stream and parses it. The encoding used is "utf8".
+ * This function should be used when parsing very large JSON files.
+ *
+ * @param absolutePathToFile The path to the file.
+ * @returns The parsed JSON object.
+ * @throws FileNotFoundError if the file doesn't exist.
+ * @throws InvalidFileFormatError if the file is not a valid JSON file.
+ * @throws IsDirectoryError if the path is a directory instead of a file.
+ * @throws FileSystemAccessError for any other error.
+ */
+export async function readJsonFileAsStream<T>(
+  absolutePathToFile: string,
+): Promise<T> {
+  const parser = new JSONParser();
+
+  let fileContents: ReadStream;
+  try {
+    fileContents = createReadStream(absolutePathToFile, "utf8");
+  } catch (e) {
+    ensureError<NodeJS.ErrnoException>(e);
+
+    if (e.code === "ENOENT") {
+      throw new FileNotFoundError(absolutePathToFile, e);
+    }
+
+    if (e.code === "EISDIR") {
+      throw new IsDirectoryError(absolutePathToFile, e);
+    }
+
+    throw new FileSystemAccessError(e.message, e);
+  }
+
+  const readPipeline = fileContents.pipe(parser);
+
+  // NOTE: We save only the last result as it contains the fully parsed object
+  let result: T | undefined;
+  readPipeline.on("data", ({ value }) => {
+    result = value;
+  });
+
+  try {
+    await finished(readPipeline);
+  } catch (e) {
+    ensureError(e);
+    throw new InvalidFileFormatError(absolutePathToFile, e);
+  }
+
+  if (result === undefined) {
+    throw new InvalidFileFormatError(absolutePathToFile, new Error("No data"));
+  }
+
+  return result;
+}
+
+/**
  * Writes an object to a JSON file. The encoding used is "utf8" and the file is overwritten.
  * If part of the path doesn't exist, it will be created.
  *
@@ -209,6 +271,69 @@ export async function writeJsonFile<T>(
   }
 
   await writeUtf8File(absolutePathToFile, content);
+}
+
+/**
+ * Writes an object to a JSON file as stream. The encoding used is "utf8" and the file is overwritten.
+ * If part of the path doesn't exist, it will be created.
+ * This function should be used when stringifying very large JSON objects.
+ *
+ * @param absolutePathToFile The path to the file. If the file exists, it will be overwritten.
+ * @param object The object to write.
+ * @throws JsonSerializationError if the object can't be serialized to JSON.
+ * @throws FileSystemAccessError for any other error.
+ */
+export async function writeJsonFileAsStream<T>(
+  absolutePathToFile: string,
+  object: T,
+): Promise<void> {
+  const dirPath = path.dirname(absolutePathToFile);
+  const dirExists = await exists(dirPath);
+  if (!dirExists) {
+    await mkdir(dirPath);
+  }
+
+  let fileContents: WriteStream;
+  try {
+    fileContents = createWriteStream(absolutePathToFile, "utf8");
+  } catch (e) {
+    ensureError<NodeJS.ErrnoException>(e);
+    // if the directory was created, we should remove it
+    if (dirExists === false) {
+      try {
+        await remove(dirPath);
+        // we don't want to override the original error
+      } catch (err) {}
+    }
+
+    if (e.code === "ENOENT") {
+      throw new FileNotFoundError(absolutePathToFile, e);
+    }
+
+    // flag "x" has been used and the file already exists
+    if (e.code === "EEXIST") {
+      throw new FileAlreadyExistsError(absolutePathToFile, e);
+    }
+
+    throw new FileSystemAccessError(e.message, e);
+  }
+
+  const jsonStream = new JsonStreamStringify(object);
+  const writePipeline = jsonStream.pipe(fileContents);
+
+  try {
+    await finished(jsonStream);
+  } catch (e) {
+    ensureError(e);
+    throw new JsonSerializationError(absolutePathToFile, e);
+  }
+
+  try {
+    await finished(writePipeline);
+  } catch (e) {
+    ensureError(e);
+    throw new FileSystemAccessError(e.message, e);
+  }
 }
 
 /**
